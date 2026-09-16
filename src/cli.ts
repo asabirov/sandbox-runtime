@@ -138,38 +138,59 @@ function parseControlFd(value: string): number {
 }
 
 /**
- * stdio for the sandboxed command: the three standard streams, plus
- * /dev/null over the control fd's slot, so nothing inside the sandbox can
- * read the channel that carries the policy confining it.
+ * stdio for the sandboxed command: the three standard streams, each
+ * --pass-fd descriptor at its own number, and /dev/null over the control
+ * fd's slot, so nothing inside the sandbox can read the channel that
+ * carries the policy confining it.
  *
- * The displacement is what matters on Linux. On macOS libuv spawns through
- * posix_spawn with POSIX_SPAWN_CLOEXEC_DEFAULT, which already keeps every
- * descriptor the caller did not list out of the child.
+ * A listed slot is what passes a descriptor: Node marks the descriptors it
+ * inherits close-on-exec at startup, so one that is not listed here does
+ * not reach the command. The control fd displacement is what matters on
+ * Linux. On macOS libuv spawns through posix_spawn with
+ * POSIX_SPAWN_CLOEXEC_DEFAULT, which already keeps every descriptor the
+ * caller did not list out of the child.
  */
 function sandboxedStdio(
   controlFd: number | undefined,
+  passFds: readonly number[],
 ): Array<'inherit' | 'ignore' | number> {
   const stdio: Array<'inherit' | 'ignore' | number> = [
     'inherit',
     'inherit',
     'inherit',
   ]
-  if (controlFd === undefined) {
-    return stdio
-  }
+  const last = Math.max(controlFd ?? 0, ...passFds)
   // 'ignore' past fd 2 leaves a slot as it is rather than closing it, so the
   // control fd's slot needs a descriptor of its own to displace it with.
-  while (stdio.length < controlFd) {
-    stdio.push('ignore')
+  for (let fd = 3; fd <= last; fd++) {
+    if (passFds.includes(fd)) {
+      stdio.push(fd)
+    } else if (fd === controlFd) {
+      // Only close-on-exec keeps an inherited descriptor out of an exec'd
+      // command, and uv_disable_stdio_inheritance() stops at the first
+      // closed number above 15, so `--control-fd 20` with 16-19 closed
+      // leaves the channel live in the sandbox. Displacing the slot covers
+      // every kind of descriptor, which re-opening the fd privately does
+      // not: a unix socket cannot be re-opened through /proc/self/fd at
+      // all (ENXIO).
+      stdio.push(fs.openSync('/dev/null', 'r'))
+    } else {
+      stdio.push('ignore')
+    }
   }
-  // Only close-on-exec keeps an inherited descriptor out of an exec'd
-  // command, and uv_disable_stdio_inheritance() stops at the first closed
-  // number above 15, so `--control-fd 20` with 16-19 closed leaves the
-  // channel live in the sandbox. Displacing the slot covers every kind of
-  // descriptor, which re-opening the fd privately does not: a unix socket
-  // cannot be re-opened through /proc/self/fd at all (ENXIO).
-  stdio.push(fs.openSync('/dev/null', 'r'))
   return stdio
+}
+
+/**
+ * Parse one --pass-fd value: an integer descriptor number from 3 to 8.
+ */
+function parsePassFd(value: string, previous: number[]): number[] {
+  if (!/^\d+$/.test(value) || Number(value) < 3 || Number(value) > 8) {
+    throw new InvalidArgumentError(
+      'must be a file descriptor between 3 and 8 (0-2 are stdin, stdout and stderr).',
+    )
+  }
+  return [...previous, Number(value)]
 }
 
 async function main(): Promise<void> {
@@ -346,6 +367,13 @@ async function main(): Promise<void> {
         'protocol; give srt a dedicated read-only end — see the README)',
       parseControlFd,
     )
+    .option(
+      '--pass-fd <fd>',
+      'pass a file descriptor (3-8) that the caller opened to the sandboxed ' +
+        'command at the same number (repeatable)',
+      parsePassFd,
+      [] as number[],
+    )
     .allowUnknownOption()
     .action(
       async (
@@ -355,6 +383,7 @@ async function main(): Promise<void> {
           settings?: string
           c?: string
           controlFd?: number
+          passFd?: number[]
         },
       ) => {
         try {
@@ -429,6 +458,17 @@ async function main(): Promise<void> {
           let receivedAnyLine = false
           let controlErrorReported = false
           const controlFd = options.controlFd
+          const passFds = [...new Set(options.passFd ?? [])]
+          if (controlFd !== undefined && passFds.includes(controlFd)) {
+            console.error(
+              `Error: fd ${controlFd} cannot be both --control-fd and --pass-fd: ` +
+                'the sandboxed command must not read the control channel.',
+            )
+            process.exit(1)
+          }
+          // srt cannot check that the caller opened a --pass-fd number: an
+          // unopened one is taken by one of node's own descriptors, which
+          // looks the same. The caller must hand over every fd it names.
 
           function onControlError(err: Error): void {
             // Attached both to the stream and to the reader: the stream is
@@ -592,7 +632,10 @@ async function main(): Promise<void> {
             aboutToSpawn()
             child = spawn(argv[0], argv.slice(1), {
               shell: false,
-              stdio: 'inherit',
+              stdio:
+                passFds.length > 0
+                  ? sandboxedStdio(undefined, passFds)
+                  : 'inherit',
               env,
             })
           } else {
@@ -606,7 +649,7 @@ async function main(): Promise<void> {
             aboutToSpawn()
             child = spawn(sandboxedCommand, {
               shell: true,
-              stdio: sandboxedStdio(controlFd),
+              stdio: sandboxedStdio(controlFd, passFds),
             })
           }
 

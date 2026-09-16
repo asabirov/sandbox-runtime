@@ -1812,9 +1812,13 @@ function buildSandboxCommand(
   // nothing listens; one that takes IPv4 refuses a client to which `localhost`
   // is ::1 and that tries no second address. So the family is named: IPv6 with
   // IPv4 mapped in, which serves both, and IPv4 alone where that fails.
+  // The relays close fds 3-8, the numbers srt --pass-fd hands to the
+  // command, so a relay that outlives the command (or a connection child it
+  // forked) does not hold the caller's descriptor open.
   const relay = (port: number, socketPath: string): string =>
     `{ ${socat} TCP6-LISTEN:${port},ipv6only=0,${listen} UNIX-CONNECT:${socketPath} || ` +
-    `exec ${socat} TCP4-LISTEN:${port},${listen} UNIX-CONNECT:${socketPath}; } >/dev/null 2>&1 &`
+    `exec ${socat} TCP4-LISTEN:${port},${listen} UNIX-CONNECT:${socketPath}; } >/dev/null 2>&1 ` +
+    `3>&- 4>&- 5>&- 6>&- 7>&- 8>&- &`
   const socatCommands = [
     relay(3128, httpSocketPath),
     '_srt_http=$!',
